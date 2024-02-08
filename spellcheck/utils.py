@@ -1,5 +1,9 @@
 import random
+import math
+import time
 import re
+from tqdm import tqdm
+from functools import reduce
 from editdistpy import damerau_osa
 from collections import Counter
 
@@ -26,11 +30,6 @@ def tokens(text):
     return list(map(lambda t: t[0], re.findall(WORD_PATTERN, text.lower())))
 
 
-def combine(Pfirst, first, Prem, rem):
-    "Combine first and rem results into one (probability, words) pair."
-    return Pfirst + Prem, [first] + rem
-
-
 def string_similarity(s1, s2):
     """Calculates the similarity between two strings using the Damerau-Levenshtein distance.
     The similarity is a number between 0 and 1, where 1 means the strings are equal.
@@ -43,25 +42,41 @@ def string_similarity(s1, s2):
     return 1 - min(dist / max_dist, 1)
 
 
-def spelltest(test_set, spell_check_func, spell_dict, verbose=False):
+def spelltest(test_set, test_set_name, spell_check_func, spell_dict):
     """Run a spellchecker on a test set of (misspelled, correct) pairs; report results.
     The score is reported as the percentage of correct answers, and the percentage of unknown words.
     """
-    import time
     start = time.time()
     good, unknown = 0, 0
     n = len(test_set)
     for wrong, right in test_set:
         w = spell_check_func(wrong)
-        mmatch = (w.lower() == right.lower())
+        mmatch = w == right
         good += mmatch
         unknown += (not mmatch) and (right not in spell_dict)
-        if verbose and (not mmatch):
-            print('correct({}) => {}, expected {}'
-                  .format(wrong, w, right))
     dt = time.time() - start
-    print('{:.0%} of {} correct ({:.0%} unknown) at {:.0f} words per second '
-          .format(good / n, n, unknown / n, n / dt))
+    print('{:14}{:.0%} of {} correct ({:.0%} unknown) at {:.0f} words per second '
+          .format(test_set_name+":", good / n, n, unknown / n, n / dt))
+
+
+def spelltest_comprehensive(test_set, test_set_name, spell_check, verbose=False):
+    top1_score = 0
+    top3_score = 0
+    top5_score = 0
+    dcg = 0  # Discounted Cumulative Gain
+    for wrong, right in test_set:
+        suggestions = spell_check.correct(wrong, top_n=5)
+        top1_score += right == suggestions[0]
+        top3_score += right in suggestions[:min(3, len(suggestions))]
+        top5_score += right in suggestions
+        if right in suggestions:
+            dcg += 1 / math.log2(suggestions.index(right) + 2)
+        if verbose:
+            print('expected', right)
+            print('got     ', suggestions)
+    n = len(test_set)
+    print('{:14}Top 1: {:.0%}, Top 3: {:.0%}, Top 5: {:.0%}, DCG: {:.2f}'.format(
+        test_set_name+":", top1_score / n, top3_score / n, top5_score / n, dcg / n))
 
 
 def add_spelling_errors(phrase, error_probability=0.1, segment=False):
@@ -99,12 +114,12 @@ def add_spelling_errors(phrase, error_probability=0.1, segment=False):
     return modified_word
 
 
-def generate_test_set(corpus):
+def generate_test_set(corpus, error_prob=0.1, segment=False):
     "Generate a test set from an nltk corpus."
     test_corpus_right = list(
-        map(lambda t: t.lower(), filter(lambda t: t.isalpha(), corpus.words())))
+        map(lambda t: tokens(t)[0], filter(lambda t: len(tokens(t)) > 0, corpus.words())))
     test_corpus_wrong = list(
-        map(lambda t: add_spelling_errors(t, 0.1), test_corpus_right))
+        map(lambda t: add_spelling_errors(t, error_prob, segment), test_corpus_right))
     test_set = zip(test_corpus_wrong, test_corpus_right)
     test_set = list(filter(lambda c: c[0] != c[1], test_set))
     return test_set
@@ -115,6 +130,7 @@ def import_test_set(path):
     test = []
     with open(path) as f:
         for l in f.readlines():
+            # in some tests there can be correct answers separated by commas, take the first one
             maybe_comma = l.find(",")
             if maybe_comma != -1:
                 l = l[:maybe_comma]
@@ -127,16 +143,16 @@ def test_segmenter(segmenter, tests, verbose=False):
     Tests should be a list of sentences; each sentence should be a string.
     The function concatenates the words in each sentence, and applies the segmenter.
     """
-    result = 0
-    for test in tests:
+    results = 0
+    for test in tqdm(tests):
         words = tokens(test)
-        result = segmenter("".join(words))
-        correct = (result == words)
-        result += correct
+        segm = segmenter("".join(words))
+        correct = (segm == words)
+        results += correct
         if not correct and verbose:
             print('expected', words)
-            print('got     ', result)
-    return result / len(tests)
+            print('got     ', segm)
+    return results / len(tests)
 
 
 def test_sentence_correction(correct_text, test, verbose):
@@ -144,11 +160,12 @@ def test_sentence_correction(correct_text, test, verbose):
     Tests should be a list of (wrong, right) pairs.
     """
     result = 0
-    for wrong, right in test:
+    for wrong, right in tqdm(test):
         corrected = correct_text(wrong)
-        score = string_similarity(corrected, right) * 100
+        score = reduce(lambda a, b: a+b, map(lambda a: a[0] == a[1], zip(
+            tokens(corrected), tokens(right))), 0) / len(tokens(right))
         result += score
-        if verbose:
+        if score != 1 and verbose:
             print('score: {:.2f}%'.format(score))
             print('\texpected', right)
             print('\tgot     ', corrected)
